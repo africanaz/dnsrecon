@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Define the IP range to test
+range="enter_your_range_here"
+
+# Use nmap to perform a DNS reverse lookup on the IP range
+nmap -sL $range -oG - | awk '/Up$/{print $2}' > dns_results.txt
+
+# Use fierce to perform a DNS brute force on the IP range
+fierce -dns $range -wordlist /usr/share/fierce/hosts.txt >> dns_results.txt
+
+# Use dnsrecon to perform a DNS enumeration on the IP range
+dnsrecon -r $range -t std >> dns_results.txt
+
+# Use dnsmap to perform a DNS subdomain brute force on the IP range
+dnsmap $range -r /usr/share/dnsmap/dnsmap.txt >> dns_results.txt
+
+# Use amass to perform a DNS enumeration and IP resolution
+amass enum -ip -active -norecursive -src -d $range >> dns_results.txt
+
+# Use sublist3r to find subdomains for a given domain
+sublist3r -d $range -o sublist3r_result.txt 
+
+# Use massdns to perform a mass DNS resolution
+massdns -r /usr/share/massdns/lists/resolvers.txt -t A -o S -w massdns_result.txt $range
+

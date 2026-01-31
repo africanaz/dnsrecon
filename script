@@ -1,26 +1,235 @@
 #!/bin/bash
 
-# Define the IP range to test
-range="enter_your_range_here"
+set -euo pipefail
 
-# Use nmap to perform a DNS reverse lookup on the IP range
-nmap -sL $range -oG - | awk '/Up$/{print $2}' > dns_results.txt
+# DNS Reconnaissance Script
+# Author: [Your Name]
+# Description: Comprehensive DNS enumeration using multiple tools
+# Prerequisites: nmap, fierce, dnsrecon, dnsmap, amass, sublist3r, massdns
 
-# Use fierce to perform a DNS brute force on the IP range
-fierce -dns $range -wordlist /usr/share/fierce/hosts.txt >> dns_results.txt
+# Configuration
+readonly SCRIPT_NAME=$(basename "$0")
+readonly LOG_FILE="dns_recon_$(date +%Y%m%d_%H%M%S).log"
+readonly OUTPUT_DIR="dns_recon_results_$(date +%Y%m%d_%H%M%S)"
+readonly TOOLS=("nmap" "fierce" "dnsrecon" "dnsmap" "amass" "sublist3r" "massdns")
 
-# Use dnsrecon to perform a DNS enumeration on the IP range
-dnsrecon -r $range -t std >> dns_results.txt
+# Default values
+TARGET_RANGE=""
+WORDLIST_HOSTS="/usr/share/fierce/hosts.txt"
+WORDLIST_DNSMAP="/usr/share/dnsmap/dnsmap.txt"
+MASSDNS_RESOLVERS="/usr/share/massdns/lists/resolvers.txt"
 
-# Use dnsmap to perform a DNS subdomain brute force on the IP range
-dnsmap $range -r /usr/share/dnsmap/dnsmap.txt >> dns_results.txt
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [OPTIONS] -t TARGET_RANGE
 
-# Use amass to perform a DNS enumeration and IP resolution
-amass enum -ip -active -norecursive -src -d $range >> dns_results.txt
+OPTIONS:
+    -t TARGET_RANGE     IP range or domain to scan (required)
+    -h                  Show this help message
+    -o OUTPUT_DIR       Custom output directory (optional)
+    --hosts-wordlist    Path to hosts wordlist for fierce (default: $WORDLIST_HOSTS)
+    --dnsmap-wordlist   Path to dnsmap wordlist (default: $WORDLIST_DNSMAP)
+    --resolvers         Path to resolvers file for massdns (default: $MASSDNS_RESOLVERS)
 
-# Use sublist3r to find subdomains for a given domain
-sublist3r -d $range -o sublist3r_result.txt 
+EXAMPLES:
+    $SCRIPT_NAME -t 192.168.1.0/24
+    $SCRIPT_NAME -t example.com -o custom_output_dir
+EOF
+}
 
-# Use massdns to perform a mass DNS resolution
-massdns -r /usr/share/massdns/lists/resolvers.txt -t A -o S -w massdns_result.txt $range
+# Log function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
 
+# Check if required tools are installed
+check_dependencies() {
+    log "Checking dependencies..."
+    local missing_tools=()
+    
+    for tool in "${TOOLS[@]}"; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_tools+=("$tool")
+        fi
+    done
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        log "ERROR: Missing required tools: ${missing_tools[*]}"
+        log "Please install missing tools before running this script."
+        exit 1
+    fi
+    
+    log "All required tools are available."
+}
+
+# Validate IP range format
+validate_target() {
+    local target="$1"
+    
+    # Basic validation for IP range or domain
+    if [[ ! "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] && [[ ! "$target" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])*$ ]]; then
+        log "ERROR: Invalid target format: $target"
+        exit 1
+    fi
+    
+    log "Target validated: $target"
+}
+
+# Create output directory
+setup_environment() {
+    if [[ -d "$OUTPUT_DIR" ]]; then
+        log "ERROR: Output directory '$OUTPUT_DIR' already exists!"
+        exit 1
+    fi
+    
+    mkdir -p "$OUTPUT_DIR"
+    log "Created output directory: $OUTPUT_DIR"
+    
+    # Create individual result files in output directory
+    touch "$OUTPUT_DIR/nmap_results.txt"
+    touch "$OUTPUT_DIR/fierce_results.txt"
+    touch "$OUTPUT_DIR/dnsrecon_results.txt"
+    touch "$OUTPUT_DIR/dnsmap_results.txt"
+    touch "$OUTPUT_DIR/amass_results.txt"
+    touch "$OUTPUT_DIR/sublist3r_results.txt"
+    touch "$OUTPUT_DIR/massdns_results.txt"
+}
+
+# Perform nmap DNS reverse lookup
+run_nmap() {
+    log "Running nmap DNS reverse lookup..."
+    if nmap -sL "$TARGET_RANGE" -oG - 2>/dev/null | awk '/Up$/{print $2}' > "$OUTPUT_DIR/nmap_results.txt"; then
+        log "Nmap completed. Results saved to $OUTPUT_DIR/nmap_results.txt"
+    else
+        log "WARNING: Nmap failed or produced no results"
+    fi
+}
+
+# Perform fierce DNS brute force
+run_fierce() {
+    log "Running fierce DNS brute force..."
+    if [[ -f "$WORDLIST_HOSTS" ]]; then
+        if fierce -dns "$TARGET_RANGE" -wordlist "$WORDLIST_HOSTS" > "$OUTPUT_DIR/fierce_results.txt" 2>&1; then
+            log "Fierce completed. Results saved to $OUTPUT_DIR/fierce_results.txt"
+        else
+            log "WARNING: Fierce failed"
+        fi
+    else
+        log "WARNING: Wordlist not found: $WORDLIST_HOSTS"
+    fi
+}
+
+# Perform dnsrecon enumeration
+run_dnsrecon() {
+    log "Running dnsrecon..."
+    if dnsrecon -r "$TARGET_RANGE" -t std > "$OUTPUT_DIR/dnsrecon_results.txt" 2>&1; then
+        log "Dnsrecon completed. Results saved to $OUTPUT_DIR/dnsrecon_results.txt"
+    else
+        log "WARNING: Dnsrecon failed"
+    fi
+}
+
+# Perform dnsmap subdomain brute force
+run_dnsmap() {
+    log "Running dnsmap..."
+    if [[ -f "$WORDLIST_DNSMAP" ]]; then
+        if dnsmap "$TARGET_RANGE" -r "$WORDLIST_DNSMAP" > "$OUTPUT_DIR/dnsmap_results.txt" 2>&1; then
+            log "Dnsmap completed. Results saved to $OUTPUT_DIR/dnsmap_results.txt"
+        else
+            log "WARNING: Dnsmap failed"
+        fi
+    else
+        log "WARNING: Wordlist not found: $WORDLIST_DNSMAP"
+    fi
+}
+
+# Perform amass enumeration
+run_amass() {
+    log "Running amass..."
+    if amass enum -ip -active -norecursive -src -d "$TARGET_RANGE" > "$OUTPUT_DIR/amass_results.txt" 2>&1; then
+        log "Amass completed. Results saved to $OUTPUT_DIR/amass_results.txt"
+    else
+        log "WARNING: Amass failed"
+    fi
+}
+
+# Run sublist3r
+run_sublist3r() {
+    log "Running sublist3r..."
+    if sublist3r -d "$TARGET_RANGE" -o "$OUTPUT_DIR/sublist3r_results.txt" 2>&1; then
+        log "Sublist3r completed. Results saved to $OUTPUT_DIR/sublist3r_results.txt"
+    else
+        log "WARNING: Sublist3r failed"
+    fi
+}
+
+# Run massdns
+run_massdns() {
+    log "Running massdns..."
+    if [[ -f "$MASSDNS_RESOLVERS" ]]; then
+        if massdns -r "$MASSDNS_RESOLVERS" -t A -o S "$TARGET_RANGE" > "$OUTPUT_DIR/massdns_results.txt" 2>&1; then
+            log "Massdns completed. Results saved to $OUTPUT_DIR/massdns_results.txt"
+        else
+            log "WARNING: Massdns failed"
+        fi
+    else
+        log "WARNING: Resolvers file not found: $MASSDNS_RESOLVERS"
+    fi
+}
+
+# Combine all results
+combine_results() {
+    log "Combining all results..."
+    cat "$OUTPUT_DIR/"*.txt | sort -u > "$OUTPUT_DIR/all_results_combined.txt"
+    log "Combined results saved to $OUTPUT_DIR/all_results_combined.txt"
+}
+
+# Main execution
+main() {
+    log "Starting DNS reconnaissance for: $TARGET_RANGE"
+    log "Output directory: $OUTPUT_DIR"
+    
+    setup_environment
+    check_dependencies
+    validate_target "$TARGET_RANGE"
+    
+    run_nmap
+    run_fierce
+    run_dnsrecon
+    run_dnsmap
+    run_amass
+    run_sublist3r
+    run_massdns
+    combine_results
+    
+    log "DNS reconnaissance completed!"
+    log "Results are available in: $OUTPUT_DIR"
+}
+
+# Parse command line arguments
+while getopts "t:o:h-:" opt; do
+    case $opt in
+        t) TARGET_RANGE="$OPTARG" ;;
+        o) OUTPUT_DIR="$OPTARG" ;;
+        h) usage; exit 0 ;;
+        -) 
+            case "$OPTARG" in
+                hosts-wordlist=*) WORDLIST_HOSTS="${OPTARG#*=}" ;;
+                dnsmap-wordlist=*) WORDLIST_DNSMAP="${OPTARG#*=}" ;;
+                resolvers=*) MASSDNS_RESOLVERS="${OPTARG#*=}" ;;
+                *) log "Invalid option: --$OPTARG"; usage; exit 1 ;;
+            esac
+            ;;
+        \?) log "Invalid option: -$OPTARG"; usage; exit 1 ;;
+    esac
+done
+
+# Check if target was provided
+if [[ -z "$TARGET_RANGE" ]]; then
+    log "ERROR: Target range is required"
+    usage
+    exit 1
+fi
+
+# Execute main function
+main

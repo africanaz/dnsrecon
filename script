@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # DNS Reconnaissance Script
-# Author: [Your Name]
+# Author: GestMasters
 # Description: Comprehensive DNS enumeration using multiple tools
 # Prerequisites: nmap, fierce, dnsrecon, dnsmap, amass, sublist3r, massdns
 

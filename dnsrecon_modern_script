@@ -1,0 +1,493 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# DNS Reconnaissance Script (Modern Edition)
+# Author: africanaz
+# Description: Comprehensive DNS enumeration using modern, maintained tools
+# Updated: 2026
+
+# Modern tool stack: subfinder, findomain, dnsx, massdns, nuclei, httpx, jq
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="2.0.0"
+readonly LOG_FILE="dns_recon_$(date +%Y%m%d_%H%M%S).log"
+readonly OUTPUT_DIR="${1:-dns_recon_results_$(date +%Y%m%d_%H%M%S)}"
+readonly TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Color codes for output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
+
+# Modern tools array
+readonly TOOLS=("subfinder" "findomain" "dnsx" "massdns" "nuclei" "httpx" "jq")
+readonly OPTIONAL_TOOLS=("nmap" "curl")
+
+usage() {
+cat << EOF
+${BLUE}DNS Reconnaissance Tool v${VERSION}${NC}
+
+${BLUE}Usage:${NC} $SCRIPT_NAME [OPTIONS] -d DOMAIN
+
+${BLUE}OPTIONS:${NC}
+  -d DOMAIN             Target domain (required)
+  -o OUTPUT_DIR         Custom output directory (default: dns_recon_results_*)
+  -r RESOLVERS_FILE     Custom resolvers file for massdns
+  -t THREADS            Thread count for tools (default: 20)
+  -p PORT_SCAN          Enable port scanning on discovered IPs (slow)
+  -v VULN_SCAN          Run vulnerability scanning with nuclei
+  -q QUICK_MODE         Quick scan (subfinder + dnsx only)
+  -h                    Show this help message
+
+${BLUE}EXAMPLES:${NC}
+  $SCRIPT_NAME -d example.com
+  $SCRIPT_NAME -d example.com -o results_2026 -v
+  $SCRIPT_NAME -d example.com -q -t 50
+
+EOF
+}
+
+# Enhanced logging with colors
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local color=""
+    
+    case "$level" in
+        INFO)  color="$BLUE" ;;
+        SUCCESS) color="$GREEN" ;;
+        WARN) color="$YELLOW" ;;
+        ERROR) color="$RED" ;;
+        *) color="$NC" ;;
+    esac
+    
+    echo -e "${color}[$(date '+%Y-%m-%d %H:%M:%S')] [$level]${NC} $message" | tee -a "$LOG_FILE"
+}
+
+# Spinner animation
+spin() {
+    local pid=$!
+    local delay=0.1
+    local frames=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
+    
+    while kill -0 $pid 2>/dev/null; do
+        for frame in "${frames[@]}"; do
+            echo -ne "\r$frame Processing... "
+            sleep $delay
+        done
+    done
+    echo -ne "\r✓ Done\n"
+}
+
+# Check if tool is installed
+check_tool() {
+    if command -v "$1" &> /dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check dependencies
+check_dependencies() {
+    log INFO "Checking dependencies..."
+    
+    local missing_tools=()
+    local missing_optional=()
+    
+    for tool in "${TOOLS[@]}"; do
+        if ! check_tool "$tool"; then
+            missing_tools+=("$tool")
+        fi
+    done
+    
+    for tool in "${OPTIONAL_TOOLS[@]}"; do
+        if ! check_tool "$tool"; then
+            missing_optional+=("$tool")
+        fi
+    done
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        log ERROR "Missing required tools: ${missing_tools[*]}"
+        log ERROR "Install them using: go install + pip or your package manager"
+        log INFO "For macOS: brew install subfinder findomain dnsx massdns"
+        log INFO "For Linux: apt-get install massdns, then use go install for Go tools"
+        exit 1
+    fi
+    
+    if [[ ${#missing_optional[@]} -gt 0 ]]; then
+        log WARN "Optional tools missing: ${missing_optional[*]} (some features may be limited)"
+    fi
+    
+    log SUCCESS "All required tools are available"
+}
+
+# Validate domain format
+validate_domain() {
+    local domain="$1"
+    
+    if [[ ! "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+        log ERROR "Invalid domain format: $domain"
+        exit 1
+    fi
+    
+    log SUCCESS "Domain validated: $domain"
+}
+
+# Setup output environment
+setup_environment() {
+    if [[ -d "$OUTPUT_DIR" ]]; then
+        log WARN "Output directory exists: $OUTPUT_DIR (results will be appended)"
+    else
+        mkdir -p "$OUTPUT_DIR"
+        log SUCCESS "Created output directory: $OUTPUT_DIR"
+    fi
+    
+    # Create subdirectories for organized output
+    mkdir -p "$OUTPUT_DIR/raw" "$OUTPUT_DIR/processed" "$OUTPUT_DIR/logs"
+}
+
+# Download public resolvers if not provided
+setup_resolvers() {
+    local resolvers_file="${1:-$OUTPUT_DIR/resolvers.txt}"
+    
+    if [[ ! -f "$resolvers_file" ]]; then
+        log INFO "Downloading public resolvers..."
+        if curl -s "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" -o "$resolvers_file" 2>/dev/null; then
+            log SUCCESS "Downloaded $(wc -l < "$resolvers_file") resolvers"
+        else
+            log WARN "Could not download resolvers, using system resolvers"
+            cat /etc/resolv.conf | grep nameserver | awk '{print $2}' > "$resolvers_file"
+        fi
+    fi
+    
+    echo "$resolvers_file"
+}
+
+# Run subfinder (fast, reliable subdomain enumeration)
+run_subfinder() {
+    local domain="$1"
+    local output="$OUTPUT_DIR/raw/subfinder_${TIMESTAMP}.txt"
+    
+    log INFO "Running subfinder (multiple sources)..."
+    
+    if subfinder -d "$domain" -all -o "$output" -silent 2>/dev/null; then
+        local count=$(wc -l < "$output")
+        log SUCCESS "Subfinder found $count subdomains"
+        return 0
+    else
+        log WARN "Subfinder encountered an issue"
+        return 1
+    fi
+}
+
+# Run findomain (fast alternative/complement)
+run_findomain() {
+    local domain="$1"
+    local output="$OUTPUT_DIR/raw/findomain_${TIMESTAMP}.txt"
+    
+    log INFO "Running findomain..."
+    
+    if findomain -t "$domain" > "$output" 2>/dev/null; then
+        local count=$(wc -l < "$output")
+        log SUCCESS "Findomain found $count subdomains"
+        return 0
+    else
+        log WARN "Findomain encountered an issue"
+        return 1
+    fi
+}
+
+# DNS validation and resolution with dnsx
+run_dnsx() {
+    local input_file="$1"
+    local output="$OUTPUT_DIR/raw/dnsx_resolved_${TIMESTAMP}.txt"
+    
+    log INFO "Validating DNS records and resolving IPs (dnsx)..."
+    
+    if [[ ! -f "$input_file" ]]; then
+        log ERROR "Input file not found: $input_file"
+        return 1
+    fi
+    
+    if dnsx -list "$input_file" -a -aaaa -cname -ns -soa -json -o "$output" 2>/dev/null; then
+        log SUCCESS "DNS validation completed"
+        # Convert JSON to readable format
+        jq -r '.host' "$output" 2>/dev/null | sort -u > "$OUTPUT_DIR/processed/resolved_hosts_${TIMESTAMP}.txt"
+        return 0
+    else
+        log WARN "dnsx validation partially failed"
+        return 1
+    fi
+}
+
+# Mass DNS resolution with massdns
+run_massdns() {
+    local domain="$1"
+    local resolvers="$2"
+    local output="$OUTPUT_DIR/raw/massdns_${TIMESTAMP}.txt"
+    
+    log INFO "Running massdns for batch resolution..."
+    
+    if [[ ! -f "$resolvers" ]]; then
+        log WARN "Resolvers file not found, skipping massdns"
+        return 1
+    fi
+    
+    # Generate subdomain list from domain
+    local subdomains_file="$OUTPUT_DIR/subdomains_${TIMESTAMP}.txt"
+    cat "$OUTPUT_DIR"/raw/subfinder_*.txt "$OUTPUT_DIR"/raw/findomain_*.txt 2>/dev/null | sort -u > "$subdomains_file"
+    
+    if massdns -r "$resolvers" -t A -o S "$subdomains_file" 2>/dev/null | tee "$output" > /dev/null; then
+        log SUCCESS "Massdns resolution completed"
+        return 0
+    else
+        log WARN "Massdns encountered issues"
+        return 1
+    fi
+}
+
+# Combine and deduplicate results
+combine_results() {
+    log INFO "Combining and deduplicating results..."
+    
+    local combined_file="$OUTPUT_DIR/processed/all_subdomains_${TIMESTAMP}.txt"
+    local ips_file="$OUTPUT_DIR/processed/unique_ips_${TIMESTAMP}.txt"
+    
+    # Combine subdomains
+    find "$OUTPUT_DIR/raw" -name "subfinder_*.txt" -o -name "findomain_*.txt" | xargs cat 2>/dev/null | sort -u > "$combined_file"
+    
+    # Extract unique IPs from dnsx/massdns results
+    find "$OUTPUT_DIR/raw" -name "dnsx_*.txt" -o -name "massdns_*.txt" | xargs grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' 2>/dev/null | sort -u > "$ips_file"
+    
+    log SUCCESS "Combined $(wc -l < "$combined_file") unique subdomains"
+    [[ -f "$ips_file" ]] && log SUCCESS "Found $(wc -l < "$ips_file") unique IP addresses"
+}
+
+# Port scanning on discovered IPs
+run_port_scan() {
+    local ips_file="$1"
+    local output="$OUTPUT_DIR/processed/nmap_ports_${TIMESTAMP}.txt"
+    
+    if ! check_tool "nmap"; then
+        log WARN "nmap not installed, skipping port scanning"
+        return 1
+    fi
+    
+    log INFO "Running nmap on discovered IPs (this may take a while)..."
+    
+    if nmap -iL "$ips_file" -p 80,443,8080,8443,3306,5432 -T4 -oG "$output" 2>/dev/null; then
+        log SUCCESS "Port scan completed"
+        return 0
+    else
+        log WARN "Port scan encountered issues"
+        return 1
+    fi
+}
+
+# Vulnerability scanning with nuclei
+run_vulnerability_scan() {
+    local targets_file="$1"
+    local output="$OUTPUT_DIR/processed/nuclei_results_${TIMESTAMP}.json"
+    
+    log INFO "Running nuclei for vulnerability detection..."
+    
+    if [[ ! -f "$targets_file" ]]; then
+        log WARN "Targets file not found, creating from resolved hosts"
+        cat "$OUTPUT_DIR"/processed/resolved_hosts_*.txt 2>/dev/null | grep -E "^http" > "$targets_file" || \
+        awk '{print "http://" $0}' "$OUTPUT_DIR"/processed/unique_ips_*.txt > "$targets_file"
+    fi
+    
+    if nuclei -list "$targets_file" -json -o "$output" -severity medium,high,critical 2>/dev/null; then
+        log SUCCESS "Vulnerability scan completed"
+        return 0
+    else
+        log WARN "Nuclei scan had issues"
+        return 1
+    fi
+}
+
+# Generate HTML report
+generate_report() {
+    local report_file="$OUTPUT_DIR/DNS_Recon_Report_${TIMESTAMP}.html"
+    
+    log INFO "Generating HTML report..."
+    
+    cat > "$report_file" << 'HTMLEOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DNS Reconnaissance Report</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 8px; margin-bottom: 30px; }
+        h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .timestamp { font-size: 0.9em; opacity: 0.9; }
+        .section { background: white; padding: 25px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h2 { color: #667eea; border-bottom: 2px solid #667eea; padding-bottom: 10px; margin-bottom: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; text-align: center; }
+        .stat-number { font-size: 2em; font-weight: bold; }
+        .stat-label { opacity: 0.9; margin-top: 5px; }
+        .results-list { background: #f9f9f9; padding: 15px; border-radius: 5px; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 0.9em; }
+        .results-list li { list-style: none; padding: 5px 0; border-bottom: 1px solid #eee; }
+        footer { text-align: center; color: #999; padding: 20px; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>DNS Reconnaissance Report</h1>
+            <p class="timestamp">Generated on <span id="reportTime"></span></p>
+        </header>
+        
+        <div class="section">
+            <h2>Scan Summary</h2>
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-number" id="subdomainCount">0</div>
+                    <div class="stat-label">Subdomains Found</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="ipCount">0</div>
+                    <div class="stat-label">Unique IPs</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="vulnCount">0</div>
+                    <div class="stat-label">Vulnerabilities</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>Top Subdomains</h2>
+            <ul class="results-list" id="subdomainList"></ul>
+        </div>
+        
+        <div class="section">
+            <h2>Discovered IP Addresses</h2>
+            <ul class="results-list" id="ipList"></ul>
+        </div>
+        
+        <footer>
+            <p>DNS Reconnaissance Tool v2.0.0 | Modern Edition</p>
+            <p>Use responsibly and only on systems you own or have permission to test</p>
+        </footer>
+    </div>
+    
+    <script>
+        document.getElementById('reportTime').textContent = new Date().toLocaleString();
+    </script>
+</body>
+</html>
+HTMLEOF
+    
+    log SUCCESS "Report generated: $report_file"
+}
+
+# Main execution
+main() {
+    local domain="$1"
+    local quick_mode=0
+    local run_vuln_scan=0
+    local run_port_scan_flag=0
+    local threads=20
+    local resolvers=""
+    
+    # Parse additional arguments
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -q|--quick) quick_mode=1; shift ;;
+            -v|--vuln) run_vuln_scan=1; shift ;;
+            -p|--port) run_port_scan_flag=1; shift ;;
+            -t|--threads) threads="$2"; shift 2 ;;
+            -r|--resolvers) resolvers="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    
+    log INFO "╔════════════════════════════════════════╗"
+    log INFO "║  DNS Reconnaissance Tool v${VERSION}       ║"
+    log INFO "║  Modern Edition - 2026 Update          ║"
+    log INFO "╚════════════════════════════════════════╝"
+    
+    log INFO "Domain: $domain"
+    log INFO "Mode: $([ $quick_mode -eq 1 ] && echo 'Quick Scan' || echo 'Full Scan')"
+    log INFO "Output Directory: $OUTPUT_DIR"
+    
+    check_dependencies
+    validate_domain "$domain"
+    setup_environment
+    
+    # Setup resolvers if needed
+    resolvers=$(setup_resolvers "$resolvers")
+    
+    # Run primary enumeration
+    run_subfinder "$domain" || true
+    
+    if [[ $quick_mode -eq 0 ]]; then
+        run_findomain "$domain" || true
+    fi
+    
+    # Combine enumeration results
+    local combined_list="$OUTPUT_DIR/combined_subdomains_${TIMESTAMP}.txt"
+    find "$OUTPUT_DIR/raw" -name "subfinder_*.txt" -o -name "findomain_*.txt" 2>/dev/null | xargs cat 2>/dev/null | sort -u > "$combined_list"
+    
+    # DNS validation
+    run_dnsx "$combined_list" || true
+    
+    if [[ $quick_mode -eq 0 ]]; then
+        run_massdns "$domain" "$resolvers" || true
+    fi
+    
+    # Combine results
+    combine_results
+    
+    # Optional: Port scanning
+    if [[ $run_port_scan_flag -eq 1 ]]; then
+        local ips_file="$OUTPUT_DIR/processed/unique_ips_${TIMESTAMP}.txt"
+        if [[ -f "$ips_file" ]] && [[ -s "$ips_file" ]]; then
+            run_port_scan "$ips_file" || true
+        fi
+    fi
+    
+    # Optional: Vulnerability scanning
+    if [[ $run_vuln_scan -eq 1 ]]; then
+        local targets="$OUTPUT_DIR/processed/resolved_hosts_${TIMESTAMP}.txt"
+        if [[ -f "$targets" ]]; then
+            run_vulnerability_scan "$targets" || true
+        fi
+    fi
+    
+    # Generate report
+    generate_report
+    
+    log SUCCESS "╔════════════════════════════════════════╗"
+    log SUCCESS "║  Scan Complete!                       ║"
+    log SUCCESS "╚════════════════════════════════════════╝"
+    log SUCCESS "Results: $OUTPUT_DIR"
+    log INFO "Log file: $LOG_FILE"
+}
+
+# Entry point
+if [[ $# -lt 2 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+if [[ "$1" != "-d" ]]; then
+    log ERROR "Domain must be specified with -d flag"
+    usage
+    exit 1
+fi
+
+main "$2" "${@:3}"
